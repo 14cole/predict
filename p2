@@ -3,13 +3,13 @@ import re
 import numpy as np
 
 # --- CONFIGURATION ---
-DATA_FOLDER = "./data"  # Path to your data folder
+DATA_FOLDER = 'datasets'  # Path to your data folder
 FILENAME_PATTERN = r"([a-zA-Z]+)([0-9.]+)"  # Generic pattern for name + value
 
 # --- 1. PARSE FILENAMES TO EXTRACT FEATURES ---
 def parse_filename(filename):
-    # Remove extension and split by underscores
-    name_parts = filename.split(".")[0].split("_")
+    name_without_ext = os.path.splitext(filename)[0]
+    name_parts = name_without_ext.split("_")
     features = {}
     for part in name_parts:
         match = re.match(FILENAME_PATTERN, part)
@@ -19,6 +19,8 @@ def parse_filename(filename):
         else:
             print(f"Could not parse part: {part}")
     return features
+
+
 
 # Gather filenames
 filenames = [f for f in os.listdir(DATA_FOLDER) if f.endswith(".txt")]
@@ -57,9 +59,9 @@ def predict_from_filename(filename):
 
 # --- 5. EXAMPLE PREDICTIONS ---
 future_files = [
-    "temp30_humidity55_pressure1008.txt",
-    "speed60_time100_distance280.txt",
-    "temp28_pressure1005_humidity65.txt"  # Order doesn't matter
+    "gap10.0_width5.1_height5.6_thick8.9.txt",
+    "gap3.1_width5.2_height5.4_thick9.1.txt",
+    "gap3.0_width5.4_height5.9_thick10.2.txt",
 ]
 
 for fname in future_files:
