@@ -1,0 +1,67 @@
+import os
+import re
+import numpy as np
+
+# --- CONFIGURATION ---
+DATA_FOLDER = "./data"  # Path to your data folder
+FILENAME_PATTERN = r"([a-zA-Z]+)([0-9.]+)"  # Generic pattern for name + value
+
+# --- 1. PARSE FILENAMES TO EXTRACT FEATURES ---
+def parse_filename(filename):
+    # Remove extension and split by underscores
+    name_parts = filename.split(".")[0].split("_")
+    features = {}
+    for part in name_parts:
+        match = re.match(FILENAME_PATTERN, part)
+        if match:
+            var_name, value = match.groups()
+            features[var_name.lower()] = float(value)
+        else:
+            print(f"Could not parse part: {part}")
+    return features
+
+# Gather filenames
+filenames = [f for f in os.listdir(DATA_FOLDER) if f.endswith(".txt")]
+
+# Extract all possible feature names
+feature_dicts = [parse_filename(fname) for fname in filenames]
+all_feature_names = sorted({k for features in feature_dicts for k in features.keys()})
+
+# Build X matrix (aligned by feature name)
+X = []
+for features in feature_dicts:
+    row = [features.get(name, 0.0) for name in all_feature_names]
+    X.append(row)
+X = np.array(X)
+
+# Simulated target values (replace with actual targets from files if needed)
+np.random.seed(0)
+y = np.random.uniform(10, 100, size=len(filenames))
+
+# --- 2. ADD INTERCEPT TERM ---
+X_bias = np.hstack([np.ones((X.shape[0], 1)), X])
+
+# --- 3. FIT MULTIPLE LINEAR REGRESSION (Normal Equation) ---
+theta = np.linalg.inv(X_bias.T @ X_bias) @ X_bias.T @ y
+
+print("Feature names (in order):", all_feature_names)
+print("Regression Coefficients (theta):", theta)
+
+# --- 4. PREDICTION FUNCTION ---
+def predict_from_filename(filename):
+    features = parse_filename(filename)
+    x_row = [features.get(name, 0.0) for name in all_feature_names]
+    x_row_bias = np.hstack([1, np.array(x_row)])
+    prediction = x_row_bias @ theta
+    return prediction
+
+# --- 5. EXAMPLE PREDICTIONS ---
+future_files = [
+    "temp30_humidity55_pressure1008.txt",
+    "speed60_time100_distance280.txt",
+    "temp28_pressure1005_humidity65.txt"  # Order doesn't matter
+]
+
+for fname in future_files:
+    prediction = predict_from_filename(fname)
+    print(f"{fname} → Predicted value: {prediction:.2f}")
