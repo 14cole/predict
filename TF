@@ -1,0 +1,219 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Input, Dense, Add, Layer, Concatenate
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+
+# --- Custom Sine Activation Layer ---
+class Sine(Layer):
+    def call(self, inputs):
+        return tf.sin(inputs)
+
+    def get_config(self):
+        return super().get_config()
+
+
+# --- Fourier Feature Mapping Layer ---
+class FourierFeatures(Layer):
+    def __init__(self, num_frequencies=10, std=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.num_frequencies = num_frequencies
+        self.std = std
+
+    def build(self, input_shape):
+        dim = input_shape[-1]
+        self.B = self.add_weight(
+            name='fourier_weights',
+            shape=(dim, self.num_frequencies),
+            initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=self.std),
+            trainable=False
+        )
+
+    def call(self, x):
+        x_proj = 2 * np.pi * tf.matmul(x, self.B)
+        return tf.concat([tf.sin(x_proj), tf.cos(x_proj)], axis=-1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "num_frequencies": self.num_frequencies,
+            "std": self.std
+        })
+        return config
+
+
+# --- Model Builder ---
+def build_model(input_dim):
+    inputs = Input(shape=(input_dim,))
+    fourier = FourierFeatures(num_frequencies=16)(inputs)
+    combined_input = Concatenate()([inputs, fourier])
+    x = Dense(256, activation='relu')(combined_input)
+    x_sin = Dense(128)(x)
+    x_sin = Sine()(x_sin)
+    x_relu = Dense(128, activation='relu')(x)
+    x_combined = Add()([x_sin, x_relu])
+    x = Dense(64, activation='relu')(x_combined)
+    x = Dense(32, activation='relu')(x)
+    output = Dense(1)(x)
+    return Model(inputs=inputs, outputs=output)
+
+
+# --- Initial Training ---
+def build_and_train_model(X, y, model_path="irregular_model.h5", epochs=300, batch_size=64, test_size=0.2):
+    y = y.reshape(-1, 1)
+    X_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+    X_scaled = X_scaler.fit_transform(X)
+    y_scaled = y_scaler.fit_transform(y)
+
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_scaled, test_size=test_size, random_state=42)
+
+    model = build_model(X.shape[1])
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+
+    early_stop = EarlyStopping(monitor='val_loss', patience=25, restore_best_weights=True)
+    model.fit(X_train, y_train,
+              validation_data=(X_test, y_test),
+              epochs=epochs,
+              batch_size=batch_size,
+              callbacks=[early_stop],
+              verbose=1)
+
+    model.save(model_path)
+    np.save(model_path + "_X_scaler.npy", X_scaler.mean_)
+    np.save(model_path + "_X_scale.npy", X_scaler.scale_)
+    np.save(model_path + "_y_scaler.npy", y_scaler.mean_)
+    np.save(model_path + "_y_scale.npy", y_scaler.scale_)
+    np.save(model_path + "_X_train.npy", X)
+    np.save(model_path + "_y_train.npy", y)
+
+    return model
+
+
+# --- Prediction ---
+def load_model_and_predict(X_new, model_path="irregular_model.h5"):
+    model = load_model(model_path, custom_objects={'Sine': Sine, 'FourierFeatures': FourierFeatures})
+    X_mean = np.load(model_path + "_X_scaler.npy")
+    X_scale = np.load(model_path + "_X_scale.npy")
+    y_mean = np.load(model_path + "_y_scaler.npy")
+    y_scale = np.load(model_path + "_y_scale.npy")
+
+    X_new_scaled = (X_new - X_mean) / X_scale
+    y_scaled_pred = model.predict(X_new_scaled)
+    y_pred = y_scaled_pred * y_scale + y_mean
+    return y_pred.ravel()
+
+
+# --- Continue Training with Drift Handling ---
+def continue_training_model_with_scaler_update(
+    X_add, y_add, model_path="irregular_model.h5",
+    epochs=100, batch_size=64, validation_split=0.2,
+    drift_threshold=0.1, retrain_from_scratch=False
+):
+    model = load_model(model_path, custom_objects={'Sine': Sine, 'FourierFeatures': FourierFeatures})
+    X_mean_old = np.load(model_path + "_X_scaler.npy")
+    X_scale_old = np.load(model_path + "_X_scale.npy")
+    y_mean_old = np.load(model_path + "_y_scaler.npy")
+    y_scale_old = np.load(model_path + "_y_scale.npy")
+
+    X_add_mean = np.mean(X_add, axis=0)
+    X_add_std = np.std(X_add, axis=0)
+
+    drift_mean = np.mean(np.abs(X_add_mean - X_mean_old) / (X_scale_old + 1e-8))
+    drift_std = np.mean(np.abs(X_add_std - X_scale_old) / (X_scale_old + 1e-8))
+
+    print(f"Drift Detected: mean drift = {drift_mean:.3f}, std drift = {drift_std:.3f}")
+
+    if drift_mean > drift_threshold or drift_std > drift_threshold:
+        print("Significant drift detected. Updating scalers...")
+
+        try:
+            X_orig = np.load(model_path + "_X_train.npy")
+            y_orig = np.load(model_path + "_y_train.npy")
+        except FileNotFoundError:
+            raise RuntimeError("Cannot retrain with new scalers: original training data not found.")
+
+        X_combined = np.vstack([X_orig, X_add])
+        y_combined = np.hstack([y_orig, y_add])
+
+        X_scaler = StandardScaler()
+        y_scaler = StandardScaler()
+        X_scaled = X_scaler.fit_transform(X_combined)
+        y_scaled = y_scaler.fit_transform(y_combined.reshape(-1, 1))
+
+        if retrain_from_scratch:
+            print("Retraining from scratch.")
+            model = build_model(X_combined.shape[1])
+            model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+
+        early_stop = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+        model.fit(X_scaled, y_scaled,
+                  validation_split=validation_split,
+                  epochs=epochs,
+                  batch_size=batch_size,
+                  callbacks=[early_stop],
+                  verbose=1)
+
+        model.save(model_path)
+        np.save(model_path + "_X_scaler.npy", X_scaler.mean_)
+        np.save(model_path + "_X_scale.npy", X_scaler.scale_)
+        np.save(model_path + "_y_scaler.npy", y_scaler.mean_)
+        np.save(model_path + "_y_scale.npy", y_scaler.scale_)
+        np.save(model_path + "_X_train.npy", X_combined)
+        np.save(model_path + "_y_train.npy", y_combined)
+        print("Updated model and scalers saved.")
+        return model
+    else:
+        print("Drift within acceptable range. Continuing training with existing scalers.")
+
+        X_new_scaled = (X_add - X_mean_old) / X_scale_old
+        y_new_scaled = (y_add.reshape(-1, 1) - y_mean_old) / y_scale_old
+
+        early_stop = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True)
+        model.fit(X_new_scaled, y_new_scaled,
+                  validation_split=validation_split,
+                  epochs=epochs,
+                  batch_size=batch_size,
+                  callbacks=[early_stop],
+                  verbose=1)
+
+        model.save(model_path)
+        print("Model retrained with existing scalers.")
+        return model
+
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    np.random.seed(0)
+    n_samples, n_features = 8000, 40
+    X = np.random.rand(n_samples, n_features)
+
+    # Irregular target: linear + varied oscillations
+    y = (
+        np.sum(X[:, :5], axis=1) +
+        np.sin(7 * X[:, 5]) +
+        0.5 * np.sin(13.3 * X[:, 6] + 0.7) +
+        0.3 * np.sin(2 * np.pi * X[:, 7]**2) +
+        0.1 * np.random.randn(n_samples)
+    )
+
+    # Train initial model
+    build_and_train_model(X, y)
+
+    # Simulate new data
+    X_new = np.random.rand(1000, 40)
+    y_new = (
+        np.sum(X_new[:, :5], axis=1) +
+        np.sin(9 * X_new[:, 5]) +
+        0.4 * np.sin(15 * X_new[:, 6])
+    )
+
+    # Retrain with drift detection
+    continue_training_model_with_scaler_update(X_new, y_new, retrain_from_scratch=True)
+
+    # Predict
+    preds = load_model_and_predict(X_new[:5])
+    print("Sample predictions:", preds)
