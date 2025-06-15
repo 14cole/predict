@@ -1,0 +1,124 @@
+# COMPARISON: PyTorch vs TensorFlow on complex regression
+# Goal: Predict outputs with mixed linear and oscillatory behavior using Fourier embeddings
+
+# =======================
+# PyTorch Implementation
+# =======================
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import numpy as np
+
+class FourierFeatureEncoder(nn.Module):
+    def __init__(self, input_dim, n_features=64, scale=10.0):
+        super().__init__()
+        B = torch.randn((input_dim, n_features)) * scale
+        self.register_buffer('B', B)
+
+    def forward(self, x):
+        x_proj = 2 * np.pi * x @ self.B
+        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+
+class PyTorchModel(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.encoder = FourierFeatureEncoder(input_dim)
+        self.net = nn.Sequential(
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1)
+        )
+
+    def forward(self, x):
+        x = self.encoder(x)
+        return self.net(x)
+
+# Training loop for PyTorch
+def train_pytorch(X, y):
+    model = PyTorchModel(X.shape[1])
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+
+    for epoch in range(500):
+        model.train()
+        x_batch = torch.tensor(X_train, dtype=torch.float32)
+        y_batch = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+        pred = model(x_batch)
+        loss = loss_fn(pred, y_batch)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        if epoch % 50 == 0:
+            model.eval()
+            val_pred = model(torch.tensor(X_val, dtype=torch.float32))
+            val_loss = loss_fn(val_pred, torch.tensor(y_val, dtype=torch.float32).view(-1, 1))
+            print(f"Epoch {epoch}, Val Loss: {val_loss.item():.4f}")
+
+    return model, scaler
+
+
+# ==========================
+# TensorFlow Implementation
+# ==========================
+import tensorflow as tf
+from tensorflow.keras import layers, models
+
+class FourierLayer(tf.keras.layers.Layer):
+    def __init__(self, input_dim, n_features=64, scale=10.0):
+        super().__init__()
+        self.B = self.add_weight("B", shape=(input_dim, n_features), initializer=tf.keras.initializers.RandomNormal(stddev=scale), trainable=False)
+
+    def call(self, x):
+        x_proj = 2 * np.pi * tf.matmul(x, self.B)
+        return tf.concat([tf.sin(x_proj), tf.cos(x_proj)], axis=-1)
+
+def build_tf_model(input_dim):
+    inputs = tf.keras.Input(shape=(input_dim,))
+    x = FourierLayer(input_dim)(inputs)
+    x = layers.Dense(256, activation='relu')(x)
+    x = layers.Dense(256, activation='relu')(x)
+    outputs = layers.Dense(1)(x)
+    return models.Model(inputs, outputs)
+
+# Training loop for TensorFlow
+def train_tensorflow(X, y):
+    model = build_tf_model(X.shape[1])
+    model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss='mse')
+
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+
+    history = model.fit(X_train, y_train, validation_data=(X_val, y_val), epochs=500, batch_size=32, verbose=0)
+    print(f"Final Validation Loss: {history.history['val_loss'][-1]:.4f}")
+    return model, scaler
+
+
+# ====================
+# Example Dataset Use
+# ====================
+# Create synthetic data with trend + oscillation
+if __name__ == "__main__":
+    np.random.seed(42)
+    X = np.random.rand(1000, 10)
+    y = 0.5 * X[:, 0] + np.sin(10 * X[:, 1]) + 0.2 * np.random.randn(1000)
+
+    print("Training PyTorch model...")
+    pt_model, pt_scaler = train_pytorch(X, y)
+
+    print("\nTraining TensorFlow model...")
+    tf_model, tf_scaler = train_tensorflow(X, y)
+
+    # Evaluate or visualize predictions here if needed
