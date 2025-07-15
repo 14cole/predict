@@ -1,0 +1,159 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.fftpack import fft, fft2, fftshift, ifft
+from scipy.signal import stft
+
+# -----------------------------
+# Synthetic RCS Data Generator
+# -----------------------------
+def generate_rcs_data(num_angles=360, num_freqs=128, time_steps=100):
+    angles = np.linspace(0, 2*np.pi, num_angles)
+    freqs = np.linspace(1e9, 10e9, num_freqs)
+    time = np.linspace(0, 1, time_steps)
+
+    # Simulate angular variation with periodic structure
+    rcs_angle = 10 + 5 * np.cos(4 * angles) + 2 * np.random.randn(num_angles)
+
+    # Simulate frequency-domain RCS with Gaussian resonance
+    rcs_freq = 20 * np.exp(-((freqs - 5e9) ** 2) / (2 * (1e9) ** 2))
+
+    # Time-varying RCS simulating micro-Doppler from moving parts
+    rcs_time = 5 + 3 * np.sin(20 * 2 * np.pi * time)
+
+    return angles, rcs_angle, freqs, rcs_freq, time, rcs_time
+
+# -----------------------------
+# 1. Angular FFT Profile
+# -----------------------------
+def fft_angular_profile(rcs_angle):
+    fft_result = fft(rcs_angle)
+    return np.abs(fftshift(fft_result))
+
+# -----------------------------
+# 2. ISAR Imaging using 2D FFT
+# -----------------------------
+def isar_image(rcs_freq, rcs_angle):
+    rcs_matrix = np.outer(rcs_freq, rcs_angle)
+    image = np.abs(fftshift(fft2(rcs_matrix)))
+    return image
+
+# -----------------------------
+# 3. Spectral Peak Extraction
+# -----------------------------
+def extract_peaks(rcs_angle):
+    spectrum = np.abs(fft(rcs_angle))
+    peak_indices = np.argsort(spectrum)[-5:]
+    return peak_indices, spectrum[peak_indices]
+
+# -----------------------------
+# 4. Micro-Doppler FFT
+# -----------------------------
+def micro_doppler(rcs_time):
+    doppler = np.abs(fft(rcs_time))
+    return doppler
+
+# -----------------------------
+# 5. Short-Time Fourier Transform
+# -----------------------------
+def stft_rcs(rcs_time, fs=100):
+    f, t, Zxx = stft(rcs_time, fs=fs, window='hann', nperseg=32)
+    return f, t, np.abs(Zxx)
+
+# -----------------------------
+# 6. Angular Frequency Filtering
+# -----------------------------
+def angular_filtering(rcs_angle):
+    spectrum = fft(rcs_angle)
+    filtered = np.copy(spectrum)
+    filtered[20:-20] = 0  # Simple low-pass filter
+    return np.real(ifft(filtered))
+
+# -----------------------------
+# 7. Fourier Descriptors
+# -----------------------------
+def fourier_descriptors(rcs_angle):
+    complex_profile = rcs_angle * np.exp(1j * np.linspace(0, 2*np.pi, len(rcs_angle)))
+    descriptors = fft(complex_profile)
+    return np.abs(descriptors[:10])
+
+# -----------------------------
+# 8. RCS Whitening
+# -----------------------------
+def rcs_whitening(rcs_freq):
+    fft_rcs = fft(rcs_freq)
+    fft_rcs /= np.max(np.abs(fft_rcs))  # Normalize
+    return np.real(ifft(fft_rcs))
+
+# -----------------------------
+# Execute All Analyses
+# -----------------------------
+angles, rcs_angle, freqs, rcs_freq, time, rcs_time = generate_rcs_data()
+
+print(freqs)
+
+
+angular_profile = fft_angular_profile(rcs_angle)
+image = isar_image(rcs_freq, rcs_angle)
+peaks_idx, peaks_vals = extract_peaks(rcs_angle)
+doppler = micro_doppler(rcs_time)
+f, t, stft_result = stft_rcs(rcs_time)
+filtered_rcs = angular_filtering(rcs_angle)
+descriptors = fourier_descriptors(rcs_angle)
+whitened = rcs_whitening(rcs_freq)
+
+# -----------------------------
+# Plotting
+# -----------------------------
+fig, axs = plt.subplots(4, 2, figsize=(14, 12))
+axs = axs.ravel()
+
+# 1. Angular FFT
+axs[0].plot(angular_profile)
+axs[0].set_title("1. FFT of Angular RCS")
+axs[0].set_xlabel("Spatial Frequency Bin")
+axs[0].set_ylabel("Magnitude")
+
+# 2. ISAR Image
+axs[1].imshow(image, aspect='auto', cmap='viridis')
+axs[1].set_title("2. ISAR Image (2D FFT)")
+axs[1].set_xlabel("Cross-Range Bin")
+axs[1].set_ylabel("Range Bin")
+
+# 3. Spectral Peaks
+axs[2].stem(peaks_idx, peaks_vals)
+axs[2].set_title("3. Spectral Peaks")
+axs[2].set_xlabel("Frequency Component Index")
+axs[2].set_ylabel("Magnitude")
+
+# 4. Micro-Doppler FFT
+axs[3].plot(doppler)
+axs[3].set_title("4. Micro-Doppler Spectrum")
+axs[3].set_xlabel("Doppler Bin")
+axs[3].set_ylabel("Amplitude")
+
+# 5. STFT Visualization
+pcm = axs[4].pcolormesh(t, f, stft_result, shading='gouraud')
+axs[4].set_title("5. STFT of Time-Varying RCS")
+axs[4].set_xlabel("Time (s)")
+axs[4].set_ylabel("Frequency (Hz)")
+
+# 6. Angular Frequency Filtered RCS
+axs[5].plot(filtered_rcs)
+axs[5].set_title("6. Filtered Angular RCS")
+axs[5].set_xlabel("Angle Index")
+axs[5].set_ylabel("Filtered RCS")
+
+# 7. Fourier Descriptors
+axs[6].stem(descriptors)
+axs[6].set_title("7. Fourier Descriptors")
+axs[6].set_xlabel("Descriptor Index")
+axs[6].set_ylabel("Magnitude")
+
+# 8. Whitened RCS Profile
+axs[7].plot(whitened)
+axs[7].set_title("8. Whitened RCS Profile")
+axs[7].set_xlabel("Frequency Index")
+axs[7].set_ylabel("Normalized Amplitude")
+
+plt.tight_layout()
+plt.show()
