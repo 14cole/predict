@@ -1,0 +1,761 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# === Constants ===
+z0 = np.pi * 120.0
+np.random.seed(0)
+ENFORCE_SYMMETRY = False  # Not mandated by IEEE 1597.1. Optional: enforce Hermitian symmetry so iFFT is purely real.
+
+# ----------------------------------------------------
+# Synthetic data (kept as-is for your local generation)
+# ----------------------------------------------------
+def generate_synthetic_data(size):
+    # (Data generation is outside the scope of IEEE 1597.1. The standard assumes two input data sets.)
+    x = np.linspace(0, 10, size)
+    measured_data = np.sin(x) + np.random.normal(0, 0.1, size)
+    shift = 0.0
+    analytical_data = np.sin(x + shift * np.pi / 180.0)
+    return x, measured_data, analytical_data
+
+# -----------------------------------------
+# Real-data loader (does NOT change the math)
+# -----------------------------------------
+def _to_sorted_xy(ds):
+    """
+    Accepts an object with:
+        ds.azimuths -> 1D iterable of x values (independent variable)
+        ds.rcs      -> 1D iterable of y values (dependent variable)
+    Returns (x_sorted, y_sorted) with x strictly ascending.
+    (Sorting is a benign preprocessing step: FSV assumes data are ordered by the
+     independent variable; this does NOT change any FSV math downstream.)
+    """
+    x = np.asarray(ds.azimuths, dtype=float).ravel()
+    y = np.asarray(ds.rcs, dtype=float).ravel()
+    if x.size != y.size:
+        raise ValueError("Dataset azimuths and rcs must have the same length.")
+    idx = np.argsort(x)
+    return x[idx], y[idx]
+
+def get_input_data(use_synthetic: bool, size: int = 1000, ds_a=None, ds_b=None):
+    """
+    Unified data entry:
+      - If use_synthetic=True: returns (x1, y1), (x2, y2) from the built-in generator.
+      - If use_synthetic=False: expects ds_a, ds_b with .azimuths and .rcs; returns sorted (x,y) for each.
+    No FSV math is performed here—just input preparation.
+    """
+    if use_synthetic:
+        x, measured, analytical = generate_synthetic_data(size)
+        # Return as two datasets sharing the same x (compatible with the real-data path)
+        return (x, measured), (x, analytical)
+    else:
+        if ds_a is None or ds_b is None:
+            raise ValueError("For real data, please provide both ds_a and ds_b objects.")
+        return _to_sorted_xy(ds_a), _to_sorted_xy(ds_b)
+
+# -----------------------------------------
+# Overlap + resample (FSV working datasets)
+# -----------------------------------------
+def _overlap_and_resample(x1, y1, x2, y2):
+    """
+    Create 'working data sets' that share a common x-range and have coincident x values,
+    resampling the denser set onto the sparser set. This is Step a) of the FSV procedure:
+      - a1–a3: find region of overlap and points within it
+      - a4–a6: use the sparser set as the reference grid; linear-interpolate the other set
+      - note: if counts are equal, either set may be used as reference
+    (IEEE 1597.1, Clause 6.4, Step a)
+    """
+    xmin = max(np.min(x1), np.min(x2))
+    xmax = min(np.max(x1), np.max(x2))
+    if not (xmax > xmin):
+        raise ValueError("Datasets have no overlapping x-range.")
+
+    m1 = (x1 >= xmin) & (x1 <= xmax)
+    m2 = (x2 >= xmin) & (x2 <= xmax)
+    x1o, y1o = x1[m1], y1[m1]
+    x2o, y2o = x2[m2], y2[m2]
+    if len(x1o) == 0 or len(x2o) == 0:
+        raise ValueError("Insufficient overlap after masking.")
+
+    if len(x1o) <= len(x2o):
+        # Use sparser grid as working-x (Step a4–a6)
+        xw = x1o
+        y1w = y1o
+        y2w = np.interp(xw, x2o, y2o)
+    else:
+        xw = x2o
+        y2w = y2o
+        y1w = np.interp(xw, x1o, y1o)
+    return xw, y1w, y2w
+
+# ---------------------------------------------------
+# FFT breakpoint & transition filters (bit-for-bit)
+# ---------------------------------------------------
+def _fft_breakpoint_pairs(y):
+    """
+    Steps b) + c2–c4 of the FSV procedure:
+      - b): take FFT of the working data set
+      - c2): sum the spectrum from the 5th bin to the end
+      - c3): find i_40% where cumulative sum (from 5th bin) reaches 40% of total
+      - c4): define break-point index as bp = i_40% + 5
+    (IEEE 1597.1, Clause 6.4, Steps b, c2–c4)
+    """
+    Y = np.fft.fft(y)
+    N = len(Y)
+    start = 4  # "5th data point" in 1-based terms
+    if N <= start + 8:
+        return Y, min(N - 1, start + 5)
+
+    tail = np.abs(Y[start:]).sum()
+    csum = 0.0
+    i40 = start
+    for i in range(start, N):
+        csum += abs(Y[i])
+        if csum >= 0.4 * tail:
+            i40 = i
+            break
+    bp = min(i40 + 5, N - 1)  # +5 per Step c4
+    return Y, bp
+
+def _enforce_conjugate_symmetry(Y):
+    """
+    Optional implementation detail (not required by the standard):
+    re-impose Hermitian symmetry so the iFFT is purely real even if we only tapered around +bp.
+    """
+    N = len(Y)
+    Y = np.asarray(Y, complex).copy()
+    Y[0] = Y[0].real + 0j
+    for k in range(1, N // 2):
+        Y[-k] = np.conj(Y[k])
+    if N % 2 == 0:
+        Y[N // 2] = Y[N // 2].real + 0j
+    return Y
+
+def _apply_transition_filter(Y, bp, mode="lo"):
+    """
+    Step c5 + Tables 1 & 2:
+      - Apply the 7-point transition filter centered at bp with coefficients:
+          Table 1 (Lo): [1.000, 0.834, 0.667, 0.500, 0.334, 0.167, 0.000] at [bp-3 .. bp+3]
+          Table 2 (Hi): [0.000, 0.167, 0.334, 0.500, 0.667, 0.834, 1.000] at [bp-3 .. bp+3]
+      - For Lo: pass everything below bp-3 (gain=1), ramp across bp±3, stop above bp+3 (gain=0).
+      - For Hi: stop below bp-3 (gain=0), ramp across bp±3, pass above bp+3 (gain=1).
+    After filtering, Lo/Hi are obtained by iFFT (see below).
+    (IEEE 1597.1, Clause 6.4, Step c5; Table 1, Table 2)
+    """
+    N = len(Y)
+    Yf = np.zeros_like(Y, dtype=complex)  # start all-stop, then fill pass regions
+
+    offs = np.arange(-3, 4)
+    if mode == "lo":
+        ramp = np.array([1.000, 0.834, 0.667, 0.500, 0.334, 0.167, 0.000])
+        lo_end = max(0, bp - 3)
+        if lo_end > 0:
+            Yf[:lo_end] = Y[:lo_end]          # pass band below bp-3
+        for k, c in zip(offs, ramp):          # ramp region
+            idx = bp + k
+            if 0 <= idx < N:
+                Yf[idx] = Y[idx] * c
+        # above bp+3 stays 0 (stop)
+    else:  # mode == "hi"
+        ramp = np.array([0.000, 0.167, 0.334, 0.500, 0.667, 0.834, 1.000])
+        for k, c in zip(offs, ramp):          # ramp region
+            idx = bp + k
+            if 0 <= idx < N:
+                Yf[idx] = Y[idx] * c
+        hi_start = min(N, bp + 4)
+        if hi_start < N:
+            Yf[hi_start:] = Y[hi_start:]      # pass band above bp+3
+    return Yf
+
+def _inverse_using_first4(Y):
+    """
+    Step c1: DCs(n) is the iFFT of the first 4 FFT bins only (the rest zeroed).
+    (IEEE 1597.1, Clause 6.4, Step c1)
+    """
+    N = len(Y)
+    S = np.zeros_like(Y, dtype=complex)
+    keep = min(4, N)
+    S[:keep] = Y[:keep]
+    dc = np.fft.ifft(S).real
+    return dc
+
+def _lo_hi_components(y):
+    """
+    Steps b–d for each working data set:
+      - b, c2–c5: FFT, 40% rule, break point, apply transition filter
+      - c6: Lo_s(n) = iFFT(filtered spectrum for Table 1)
+      - d2: Hi_s(n) = iFFT(filtered spectrum for Table 2)
+      - c1: DCs(n) from first 4 FFT bins (see helper above)
+    (IEEE 1597.1, Clause 6.4, Steps b–d; Tables 1–2)
+    """
+    Y, bp = _fft_breakpoint_pairs(y)
+
+    Y_lo = _apply_transition_filter(Y, bp, mode="lo")
+    if ENFORCE_SYMMETRY:      # Optional; not required by the standard
+        Y_lo = _enforce_conjugate_symmetry(Y_lo)
+    lo = np.fft.ifft(Y_lo).real
+
+    Y_hi = _apply_transition_filter(Y, bp, mode="hi")
+    if ENFORCE_SYMMETRY:      # Optional; not required by the standard
+        Y_hi = _enforce_conjugate_symmetry(Y_hi)
+    hi = np.fft.ifft(Y_hi).real
+
+    dc = _inverse_using_first4(Y)
+    return lo, hi, dc
+
+# ---------------------------------------------
+# Derivatives & metrics (ADM/FDM/GDM)
+# ---------------------------------------------
+def _central_diff(arr, order=1):
+    """
+    Derivatives for FDM are computed with a central-difference stencil, per Eq. (4) and Eq. (5),
+    with the operator 'templates' in Eq. (6). (IEEE 1597.1, Clause 6.4, Step h; Eq. 4–6)
+    """
+    if order == 1:
+        d = np.zeros_like(arr)
+        d[1:-1] = (arr[2:] - arr[:-2]) * 0.5
+        d[0] = d[1]
+        d[-1] = d[-2]
+        return d
+    elif order == 2:
+        d1 = _central_diff(arr, order=1)
+        d2 = np.zeros_like(arr)
+        d2[1:-1] = (d1[2:] - d1[:-2]) * 0.5
+        d2[0] = d2[1]
+        d2[-1] = d2[-2]
+        return d2
+    else:
+        raise ValueError("order must be 1 or 2")
+
+def _safe_mean_norm(a, b, scale=1.0, eps=1e-12):
+    # Normalization to produce dimensionless differences; the standard describes combining
+    # derivative-based differences in FDM; specific scaling constants are implementation details.
+    ref = (np.abs(a) + np.abs(b)).mean()
+    return scale / (ref + eps)
+
+def _adm(lo1, lo2, dc1, dc2):
+    """
+    ADM(n) compares amplitude/trends (Lo) and low-order content (DCs), per Eq. (2):
+      α = Lo2 - Lo1
+      β = mean(|Lo1| + |Lo2|)
+      χ = DC2 - DC1
+      δ = mean(|DC1| + |DC2|)
+    (IEEE 1597.1, Clause 6.4, Step e; Eq. 2)
+    """
+    alpha = lo2 - lo1
+    chi = dc2 - dc1
+    beta  = (np.abs(lo1) + np.abs(lo2)).mean() + 1e-12
+    delta = (np.abs(dc1) + np.abs(dc2)).mean() + 1e-12
+    return np.abs(alpha) / beta + np.abs(chi) / delta
+
+def _fdm(lo1, hi1, hi2, lo2):
+    """
+    FDM compares rapidly changing features using first/second derivatives of Lo/Hi,
+    as directed in Step h with Eq. (4–6). Here we combine first-derivative Lo terms and
+    first/second-derivative Hi terms with normalizations so the contributions are dimensionless.
+    (IEEE 1597.1, Clause 6.4, Step h; Eq. 4–6)
+    """
+    lo1p = _central_diff(lo1, 1); lo2p = _central_diff(lo2, 1)
+    hi1p = _central_diff(hi1, 1); hi2p = _central_diff(hi2, 1)
+    hi1pp = _central_diff(hi1, 2); hi2pp = _central_diff(hi2, 2)
+
+    s1 = _safe_mean_norm(lo1p,  lo2p,  scale=2.0)
+    s2 = _safe_mean_norm(hi1p,  hi2p,  scale=6.0)
+    s3 = _safe_mean_norm(hi1pp, hi2pp, scale=2.7)
+
+    f1 = np.abs(lo2p - lo1p)  * s1
+    f2 = np.abs(hi2p - hi1p)  * s2
+    f3 = np.abs(hi2pp - hi1pp)* s3
+    return f1 + f2 + f3
+
+def _gdm(adm_point, fdm_point):
+    """
+    GDM combines ADM and FDM into a single figure of merit for the overall agreement.
+    (IEEE 1597.1, Clause 6.2 describes combining ADM & FDM to form GDM.)
+    """
+    return np.sqrt(adm_point**2 + fdm_point**2)
+
+def _mean_val(v):
+    # Step f): the mean value of ADM (and likewise for FDM/GDM) provides a single-figure 'goodness-of-fit'.
+    return float(np.mean(v))
+
+# ---------- Visual & analysis helpers ----------
+def _draw_vrs_bands(ax, xlim=None):
+    """
+    Shade the six VRS (Validation Rating Scale) ranges so the histogram can be read visually:
+    Excellent, Very good, Good, Fair, Poor, Very poor.
+    (IEEE 1597.1, Clause 6.3 + Table 3)
+    """
+    bands = [("Excellent", 0.0, 0.1),
+             ("Very good", 0.1, 0.2),
+             ("Good",      0.2, 0.4),
+             ("Fair",      0.4, 0.8),
+             ("Poor",      0.8, 1.6),
+             ("Very poor", 1.6, np.inf)]
+    if xlim is None: xlim = ax.get_xlim()
+    ymin, ymax = ax.get_ylim()
+    for name, lo, hi in bands:
+        lo = max(lo, xlim[0]); hi = min(hi, xlim[1])
+        if lo >= hi: continue
+        ax.axvspan(lo, hi, alpha=0.08, color='grey')
+        ax.text((lo+hi)/2, ymax*0.95, name, ha='center', va='top', fontsize=8)
+
+def _bootstrap_mean(v, B=200, seed=0):
+    """
+    95% CI via bootstrap for the mean (not specified by the standard; convenience for reporting uncertainty).
+    """
+    rng = np.random.default_rng(seed)
+    n = len(v); means = []
+    for _ in range(B):
+        idx = rng.integers(0, n, size=n)
+        means.append(float(np.mean(v[idx])))
+    means = np.sort(means)
+    return float(np.mean(v)), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
+
+def _assert_reconstruction(y, lo, hi, label):
+    # Internal sanity check (not part of the standard): Lo + Hi should reconstruct the signal (numerically).
+    num = np.linalg.norm((lo + hi) - y); den = np.linalg.norm(y) + 1e-12
+    rel = num/den
+    if rel > 1e-6:
+        print(f"[warn] {label}: lo+hi != y (relative error ≈ {rel:.2e})")
+
+def _topk_outliers(xw, gdm_point, k=10):
+    # Convenience visualization (not part of the standard): mark the k worst GDM locations.
+    idx = np.argsort(gdm_point)[::-1][:k]
+    return idx, xw[idx], gdm_point[idx]
+
+# -----------------------------------
+# Your existing categorization/plots
+# -----------------------------------
+def categorize_matrix(value, metric_type):
+    """
+    Map numeric FSV values to the six qualitative VRS labels, per Table 3.
+    (IEEE 1597.1, Clause 6.3, Table 3)
+    """
+    if value < 0.1:
+        return 'Excellent'
+    elif 0.1 <= value < 0.2:
+        return 'Very Good'
+    elif 0.2 <= value < 0.4:
+        return 'Good'
+    elif 0.4 <= value < 0.8:
+        return 'Fair'
+    elif 0.8 <= value < 1.6:
+        return 'Poor'
+    else:
+        return 'Very Poor'
+
+def plot_rcs_vs_azimuth(x, measured_data, analytical_data, ax, label_a="Measured Data", label_b="Analytical Data"):
+    # Simple overlay plot of the two input data sets (visual aid; not prescribed by the standard).
+    ax.plot(x, measured_data, label=label_a, color='blue', alpha=0.7)
+    ax.plot(x, analytical_data, label=label_b, color='orange', alpha=0.7)
+    ax.set_xlabel('Azimuth (degrees)')
+    ax.set_ylabel('RCS (dBsm)')
+    ax.set_title('RCS vs Azimuth (Working data)')
+    ax.axhline(0, color='gray', linewidth=1, linestyle='--')
+    ax.legend()
+    ax.grid()
+
+def plot_histogram(adm_values, mean_adm, fdm_values, mean_fdm, gdm_values, mean_gdm, ax):
+    # Show ADM/FDM/GDM distributions with VRS bands (Clause 6.3, Table 3).
+    ax[0].hist(adm_values, bins=30, color='blue', alpha=0.7, edgecolor='black')
+    ax[0].axvline(mean_adm, color='red', linestyle='dashed', linewidth=1, label='Mean ADM')
+    category_adm = categorize_matrix(mean_adm, 'ADM')
+    ax[0].text(mean_adm + 0.05, 5, f'Mean ADM: {mean_adm:.2f} ({category_adm})', color='red')
+    ax[0].set_xlabel('ADM Values'); ax[0].set_ylabel('Frequency')
+    ax[0].set_title('Histogram of Absolute Difference Metric (ADM)')
+    ax[0].grid(axis='y', alpha=0.75); ax[0].legend()
+    _draw_vrs_bands(ax[0]); ax[0].set_xlim(left=0)
+
+    ax[1].hist(fdm_values, bins=30, color='green', alpha=0.7, edgecolor='black')
+    ax[1].axvline(mean_fdm, color='orange', linestyle='dashed', linewidth=1, label='Mean FDM')
+    category_fdm = categorize_matrix(mean_fdm, 'FDM')
+    ax[1].text(mean_fdm + 0.05, 5, f'Mean FDM: {mean_fdm:.2f} ({category_fdm})', color='orange')
+    ax[1].set_xlabel('FDM Values'); ax[1].set_ylabel('Frequency')
+    ax[1].set_title('Histogram of Fluctuation Difference Metric (FDM)')
+    ax[1].grid(axis='y', alpha=0.75); ax[1].legend()
+    _draw_vrs_bands(ax[1]); ax[1].set_xlim(left=0)
+
+    ax[2].hist(gdm_values, bins=30, color='purple', alpha=0.7, edgecolor='black')
+    ax[2].axvline(mean_gdm, color='black', linestyle='dashed', linewidth=1, label='Mean GDM')
+    category_gdm = categorize_matrix(mean_gdm, 'GDM')
+    ax[2].text(mean_gdm + 0.05, 5, f'Mean GDM: {mean_gdm:.2f} ({category_gdm})', color='black')
+    ax[2].set_xlabel('GDM Values'); ax[2].set_ylabel('Frequency')
+    ax[2].set_title('Histogram of Global Difference Metric (GDM)')
+    ax[2].grid(axis='y', alpha=0.75); ax[2].legend()
+    _draw_vrs_bands(ax[2]); ax[2].set_xlim(left=0)
+
+# -----------------------------------
+# Optional extra (not part of FSV)
+# -----------------------------------
+def calculate_all_aspect_metroid(measured_data, analytical_data):
+    # Not in IEEE 1597.1. This is an extra energy-like metric you’re computing on your own scale.
+    measured_integral = np.trapz(((10**(measured_data/10))**2)/z0)
+    analytical_integral = np.trapz(((10**(analytical_data/10))**2)/z0)
+    metroid = (np.abs(measured_integral - analytical_integral) / np.abs(analytical_integral))
+    return metroid
+
+# ==============================
+# Additional, non-FSV metrics
+# ==============================
+import numpy as np
+import matplotlib.pyplot as plt
+
+def _z(a, eps=1e-12):
+    m = np.mean(a); s = np.std(a) + eps
+    return (a - m) / s
+
+def _pearson(a, b, eps=1e-12):
+    az, bz = _z(a, eps), _z(b, eps)
+    return float(np.mean(az * bz))
+
+def _circular_xcorr(a, b):
+    """
+    Circular normalized cross-correlation using FFT.
+    Returns correlation array (lags 0..N-1) and the best lag/value.
+    """
+    A = np.fft.rfft(_z(a))
+    B = np.fft.rfft(_z(b))
+    c = np.fft.irfft(A * np.conj(B), n=len(a))
+    # normalize by N to keep in [-1,1] approximately (already z-scored so close)
+    c = np.real(c) / len(a)
+    k = int(np.argmax(c))
+    return c, k, float(c[k])
+
+def _best_affine(y1, y2, eps=1e-12):
+    """
+    Fit y2 ≈ a*y1 + b (OLS, closed-form). Return a, b, RMSE, R^2.
+    """
+    x = np.vstack([y1, np.ones_like(y1)]).T
+    # Solve (x^T x)^{-1} x^T y2
+    xtx = x.T @ x
+    xty = x.T @ y2
+    coef = np.linalg.solve(xtx + eps*np.eye(2), xty)
+    a, b = coef[0], coef[1]
+    yhat = a*y1 + b
+    resid = y2 - yhat
+    rmse = float(np.sqrt(np.mean(resid**2)))
+    ss_tot = float(np.sum((y2 - np.mean(y2))**2)) + eps
+    r2 = 1.0 - float(np.sum(resid**2))/ss_tot
+    return a, b, rmse, r2
+
+def _abs_error_stats(y1, y2, p=95):
+    err = np.abs(y2 - y1)
+    return err, float(np.mean(err)), float(np.percentile(err, p)), float(np.max(err))
+
+def _wasserstein_1d_hist(y1, y2, bins=128):
+    """
+    SciPy-free 1D Wasserstein approximation via histogram CDFs on a shared grid.
+    """
+    lo = float(min(np.min(y1), np.min(y2)))
+    hi = float(max(np.max(y1), np.max(y2)))
+    edges = np.linspace(lo, hi, bins+1)
+    h1, _ = np.histogram(y1, bins=edges, density=True)
+    h2, _ = np.histogram(y2, bins=edges, density=True)
+    c1 = np.cumsum(h1); c1 /= c1[-1] if c1[-1] > 0 else 1.0
+    c2 = np.cumsum(h2); c2 /= c2[-1] if c2[-1] > 0 else 1.0
+    # integral of |CDF1 - CDF2| over support (Riemann sum)
+    dx = np.diff(edges)
+    W1 = float(np.sum(np.abs(c1 - c2) * dx))
+    return W1, edges, c1, c2
+
+def _deriv(a):
+    d = np.empty_like(a)
+    d[1:-1] = 0.5*(a[2:] - a[:-2])
+    d[0] = d[1]; d[-1] = d[-2]
+    return d
+
+def _lssa(y1, y2):
+    """
+    Local Slope Sign Agreement: fraction where sign(dy1) == sign(dy2).
+    """
+    s1 = np.sign(_deriv(y1)); s2 = np.sign(_deriv(y2))
+    agree = np.mean((s1 == s2).astype(float))
+    return float(agree)
+
+def _rank(a):
+    """
+    Simple rank transform (average rank for ties).
+    """
+    order = np.argsort(a, kind='mergesort')
+    ranks = np.empty_like(order, dtype=float)
+    ranks[order] = np.arange(len(a), dtype=float)
+    # handle ties by averaging ranks of equal values
+    vals = a[order]
+    i = 0
+    while i < len(a):
+        j = i + 1
+        while j < len(a) and vals[j] == vals[i]:
+            j += 1
+        # average ranks in [i, j)
+        rmean = np.mean(np.arange(i, j, dtype=float))
+        ranks[order[i:j]] = rmean
+        i = j
+    return ranks
+
+def _spearman_no_scipy(y1, y2):
+    r1 = _rank(y1); r2 = _rank(y2)
+    return _pearson(r1, r2)
+
+def _sam(y1, y2, eps=1e-12):
+    """
+    Spectral Angle Mapper between vectors (in radians).
+    Smaller is more similar; 0 = identical up to positive scale.
+    """
+    num = float(np.dot(y1, y2))
+    den = float(np.linalg.norm(y1)*np.linalg.norm(y2)) + eps
+    t = np.clip(num/den, -1.0, 1.0)
+    return float(np.arccos(t))
+
+def _dtw_lite(y1, y2, band_ratio=0.1):
+    """
+    Narrow-band DTW (Sakoe–Chiba band) with O(N * band) cost.
+    Returns normalized distance (per sample). Pure NumPy; OK for N~1e3.
+    """
+    n = len(y1); m = len(y2)
+    assert n == m, "DTW-lite assumes equal lengths (working sets)."
+    band = max(1, int(band_ratio*n))
+    INF = 1e18
+    D = np.full((n+1, m+1), INF, dtype=float)
+    D[0, 0] = 0.0
+    for i in range(1, n+1):
+        j_lo = max(1, i - band)
+        j_hi = min(m, i + band)
+        for j in range(j_lo, j_hi+1):
+            cost = abs(y1[i-1] - y2[j-1])
+            D[i, j] = cost + min(D[i-1, j], D[i, j-1], D[i-1, j-1])
+    return float(D[n, m] / n)
+
+def _peaks_binary(y, win=3):
+    """
+    Lightweight peak detector: a point is a peak if it's the max in a 2*win+1 window
+    and strictly greater than neighbors.
+    Returns boolean array of peaks.
+    """
+    N = len(y)
+    peaks = np.zeros(N, dtype=bool)
+    for i in range(win, N-win):
+        seg = y[i-win:i+win+1]
+        if y[i] == np.max(seg) and y[i] > seg[win-1] and y[i] > seg[win+1]:
+            peaks[i] = True
+    return peaks
+
+def _peak_match_scores(y1, y2, tol=2, win=3):
+    """
+    Match peaks from y1 to y2 within ±tol index. Returns precision, recall, F1.
+    """
+    p1 = np.where(_peaks_binary(y1, win))[0]
+    p2 = np.where(_peaks_binary(y2, win))[0]
+    if len(p1) == 0 and len(p2) == 0:
+        return 1.0, 1.0, 1.0, p1, p2, np.array([], dtype=int)
+    used = np.zeros(len(p2), dtype=bool)
+    tp = 0
+    matches = []
+    for i in p1:
+        j_candidates = np.where((p2 >= i - tol) & (p2 <= i + tol))[0]
+        j_candidates = [j for j in j_candidates if not used[j]]
+        if len(j_candidates):
+            j = j_candidates[0]
+            used[j] = True
+            tp += 1
+            matches.append(i)
+    fp = len(p2) - tp
+    fn = len(p1) - tp
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2*prec*rec/(prec+rec) if (prec+rec) > 0 else 0.0
+    return float(prec), float(rec), float(f1), p1, p2, np.asarray(matches, dtype=int)
+
+def compute_additional_metrics(x, y1, y2):
+    """
+    Compute scalar metrics (non-FSV) that complement ADM/FDM/GDM.
+    Assumes x is coincident/monotone (your working grid).
+    """
+    # 1) Cross-correlation (circular)
+    xc, best_lag, ncc_peak = _circular_xcorr(y1, y2)
+
+    # 2) Best affine fit
+    a, b, rmse, r2 = _best_affine(y1, y2)
+
+    # 3) Error stats
+    err, mean_abs, p95_abs, max_abs = _abs_error_stats(y1, y2)
+
+    # 4) Wasserstein-like (hist CDF) distance
+    W1, edges, c1, c2 = _wasserstein_1d_hist(y1, y2)
+
+    # 5) LSSA (slope sign)
+    lssa = _lssa(y1, y2)
+
+    # 6) Peak match F1
+    prec, rec, f1, p1, p2, p1matched = _peak_match_scores(y1, y2)
+
+    # 7) Angle & ranks
+    sam = _sam(y1, y2)
+    spearman = _spearman_no_scipy(y1, y2)
+
+    # 8) DTW-lite (narrow band)
+    dtw = _dtw_lite(y1, y2, band_ratio=0.1)
+
+    out = {
+        "ncc_peak": ncc_peak, "best_lag": int(best_lag),
+        "affine_a": float(a), "affine_b": float(b), "rmse": rmse, "r2": r2,
+        "mean_abs_err": mean_abs, "p95_abs_err": p95_abs, "max_abs_err": max_abs,
+        "W1_value_cdf": W1, "lssa": lssa, "peak_precision": prec,
+        "peak_recall": rec, "peak_f1": f1, "sam_rad": sam,
+        "spearman": spearman, "dtw_lite": dtw,
+        # extras for plotting:
+        "_xc": xc, "_edges": edges, "_cdf1": c1, "_cdf2": c2,
+        "_p1": p1, "_p2": p2, "_p1matched": p1matched, "_err": err
+    }
+    return out
+
+def plot_additional_similarity_dashboard(x, y1, y2, metrics=None, title_suffix=""):
+    """
+    Renders a 2x3 grid of non-FSV diagnostics without touching your original figure.
+    """
+    if metrics is None:
+        metrics = compute_additional_metrics(x, y1, y2)
+
+    fig, axs = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f"Additional Similarity Metrics {title_suffix}", fontsize=14)
+
+    # A) Cross-correlation vs circular lag
+    xc = metrics["_xc"]
+    lags = np.arange(len(xc))
+    axs[0,0].plot(lags, xc, lw=1.2)
+    axs[0,0].axvline(metrics["best_lag"], ls='--', lw=1.0, color='k')
+    axs[0,0].set_title(f"NCC (peak={metrics['ncc_peak']:.3f} at lag={metrics['best_lag']})")
+    axs[0,0].set_xlabel("Circular lag (index)"); axs[0,0].set_ylabel("NCC")
+    axs[0,0].grid(alpha=0.3)
+
+    # B) Scatter y1 vs y2 with best affine line
+    axs[0,1].scatter(y1, y2, s=8, alpha=0.4)
+    yy = np.linspace(np.min(y1), np.max(y1), 50)
+    a, b = metrics["affine_a"], metrics["affine_b"]
+    axs[0,1].plot(yy, a*yy + b, lw=1.5)
+    axs[0,1].set_title(f"Value Scatter (RMSE={metrics['rmse']:.3f}, R²={metrics['r2']:.3f})")
+    axs[0,1].set_xlabel("y1"); axs[0,1].set_ylabel("y2"); axs[0,1].grid(alpha=0.3)
+
+    # C) Absolute error histogram
+    err = metrics["_err"]
+    axs[0,2].hist(err, bins=40, edgecolor='black', alpha=0.7)
+    axs[0,2].axvline(np.mean(err), ls='--', lw=1.0, label=f"mean={metrics['mean_abs_err']:.3f}")
+    axs[0,2].axvline(np.percentile(err,95), ls=':', lw=1.0, label=f"p95={metrics['p95_abs_err']:.3f}")
+    axs[0,2].set_title("Absolute Error |y2 - y1|")
+    axs[0,2].set_xlabel("abs error"); axs[0,2].set_ylabel("count"); axs[0,2].grid(alpha=0.3); axs[0,2].legend()
+
+    # D) Value CDFs (Wasserstein-like)
+    edges = metrics["_edges"]; c1 = metrics["_cdf1"]; c2 = metrics["_cdf2"]
+    centers = 0.5*(edges[:-1] + edges[1:])
+    axs[1,0].plot(centers, c1, label="y1 CDF")
+    axs[1,0].plot(centers, c2, label="y2 CDF")
+    axs[1,0].set_title(f"CDF Match (W1≈{metrics['W1_value_cdf']:.3f})")
+    axs[1,0].set_xlabel("value"); axs[1,0].set_ylabel("CDF"); axs[1,0].legend(); axs[1,0].grid(alpha=0.3)
+
+    # E) Slope-sign agreement across x
+    s1 = np.sign(_deriv(y1)); s2 = np.sign(_deriv(y2))
+    agree_mask = (s1 == s2)
+    axs[1,1].plot(x, agree_mask.astype(float), lw=1.0)
+    axs[1,1].set_ylim(-0.1, 1.1)
+    axs[1,1].set_title(f"Slope-Sign Agreement (LSSA={metrics['lssa']:.3f})")
+    axs[1,1].set_xlabel("x"); axs[1,1].set_ylabel("agree (0/1)"); axs[1,1].grid(alpha=0.3)
+
+    # F) Peak map & matches
+    p1 = metrics["_p1"]; p2 = metrics["_p2"]; pm = set(metrics["_p1matched"].tolist())
+    axs[1,2].plot(x, _z(y1), lw=1.0, label="y1 (z)")
+    axs[1,2].plot(x, _z(y2), lw=1.0, label="y2 (z)")
+    if len(p1): axs[1,2].scatter(x[p1], _z(y1)[p1], s=30, marker='^', label="peaks y1")
+    if len(p2): axs[1,2].scatter(x[p2], _z(y2)[p2], s=30, marker='o', label="peaks y2")
+    # highlight matched y1 peaks
+    if len(pm):
+        ppm = np.array(sorted(list(pm)), dtype=int)
+        axs[1,2].scatter(x[ppm], _z(y1)[ppm], s=60, facecolors='none', edgecolors='k', label="matched y1")
+    axs[1,2].set_title(f"Peak Match (P={metrics['peak_precision']:.2f}, R={metrics['peak_recall']:.2f}, F1={metrics['peak_f1']:.2f})")
+    axs[1,2].set_xlabel("x"); axs[1,2].legend(loc="best"); axs[1,2].grid(alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig, axs
+
+
+
+# ---------------
+# Main pipeline
+# ---------------
+def main(use_synthetic: bool = True, ds_a=None, ds_b=None, size: int = 1000):
+    """
+    Run FSV with either synthetic or real data.
+
+    Examples
+    --------
+    # Synthetic (same behavior as before):
+    main(use_synthetic=True, size=1000)
+
+    # Real data (ds_a/ds_b expose .azimuths and .rcs):
+    # class DS: pass
+    # ds_a = DS(); ds_a.azimuths = ...; ds_a.rcs = ...
+    # ds_b = DS(); ds_b.azimuths = ...; ds_b.rcs = ...
+    # main(use_synthetic=False, ds_a=ds_a, ds_b=ds_b)
+    """
+    # --- Input selection (NO math changed) ---
+    (x1, y1), (x2, y2) = get_input_data(use_synthetic=use_synthetic, size=size, ds_a=ds_a, ds_b=ds_b)
+
+    # Step a): Build working data sets per the standard (common range, coincident x; interpolation).
+    xw, y1w, y2w = _overlap_and_resample(x1, y1, x2, y2)
+
+    # Steps b–d): Decompose each working set into Lo/Hi/DCs using the 40% rule and transition filters.
+    lo1, hi1, dc1 = _lo_hi_components(y1w)
+    lo2, hi2, dc2 = _lo_hi_components(y2w)
+
+    # Internal check (not in standard): Lo + Hi should reconstruct original working data.
+    _assert_reconstruction(y1w, lo1, hi1, "Series A")
+    _assert_reconstruction(y2w, lo2, hi2, "Series B")
+
+    # Step e): ADM (Eq. 2); Step h): FDM via derivatives (Eq. 4–6); GDM: combine
+    adm_point = _adm(lo1, lo2, dc1, dc2)
+    fdm_point = _fdm(lo1, hi1, hi2, lo2)
+    gdm_point = _gdm(adm_point, fdm_point)
+
+    # Mean values (plus non-standard bootstrap CI for reporting)
+    mean_adm, lo_adm, hi_adm = _bootstrap_mean(adm_point, B=300, seed=0)
+    mean_fdm, lo_fdm, hi_fdm = _bootstrap_mean(fdm_point, B=300, seed=1)
+    mean_gdm, lo_gdm, hi_gdm = _bootstrap_mean(gdm_point, B=300, seed=2)
+
+    print(f"Mean ADM: {mean_adm:.4f} (95% CI {lo_adm:.4f}..{hi_adm:.4f}) - Category: {categorize_matrix(mean_adm, 'ADM')}")
+    print(f"Mean FDM: {mean_fdm:.4f} (95% CI {lo_fdm:.4f}..{hi_fdm:.4f}) - Category: {categorize_matrix(mean_fdm, 'FDM')}")
+    print(f"Mean GDM: {mean_gdm:.4f} (95% CI {lo_gdm:.4f}..{hi_gdm:.4f}) - Category: {categorize_matrix(mean_gdm, 'GDM')}")
+
+    # Optional extra metric (not in IEEE 1597.1)
+    # Use the original, *source* y arrays here (synthetic: measured vs analytical; real: dataset A vs B).
+    metroid_all_aspect = calculate_all_aspect_metroid(y1, y2)
+    print(f"All Aspect Metroid: {metroid_all_aspect:.8f} - Category: {categorize_matrix(metroid_all_aspect, 'All Aspect Metroid')}")
+
+    # Plots: show the aligned working data (so both series share the same x)
+    fig, ax = plt.subplots(2, 2, figsize=(18, 12))
+    label_a = "Measured Data" if use_synthetic else "Dataset A (working)"
+    label_b = "Analytical Data" if use_synthetic else "Dataset B (working)"
+    plot_rcs_vs_azimuth(xw, y1w, y2w, ax[0, 0], label_a=label_a, label_b=label_b)
+    plot_histogram(adm_point, mean_adm, fdm_point, mean_fdm, gdm_point, mean_gdm, ax.flatten()[1:])
+
+    # Convenience: mark top-10 worst GDM locations (not in the standard)
+    idx, x_bad, g_bad = _topk_outliers(xw, gdm_point, k=10)
+    for xb in x_bad:
+        ax[0, 0].axvline(xb, linestyle=':', linewidth=0.8, alpha=0.5)
+    ax[0, 0].text(0.01, 0.02, f"Top-10 worst x: {np.array2string(x_bad, precision=2)}",
+                  transform=ax[0, 0].transAxes, fontsize=8, va='bottom',
+                  bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+
+    plt.tight_layout()
+    plt.show()
+
+    # After your existing plt.show() OR just before it, create a second figure:
+    metrics = compute_additional_metrics(xw, y1w, y2w)
+    print("[extra] NCC_peak={ncc_peak:.3f} at lag={best_lag}, RMSE={rmse:.3f}, R2={r2:.3f}, "
+        "W1={W1_value_cdf:.3f}, LSSA={lssa:.3f}, PeakF1={peak_f1:.3f}, "
+        "SAM(rad)={sam_rad:.3f}, Spearman={spearman:.3f}, DTW-lite={dtw_lite:.3f}".format(**metrics))
+
+    plot_additional_similarity_dashboard(xw, y1w, y2w, metrics, title_suffix="(non-FSV)")
+    plt.show()
+
+
+if __name__ == "__main__":
+    # Default stays synthetic; switch to real by calling main(use_synthetic=False, ds_a=..., ds_b=...)
+    main(use_synthetic=True, size=1000)
